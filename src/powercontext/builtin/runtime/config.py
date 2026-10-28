@@ -199,14 +199,32 @@ class RuntimeConfig(BaseModel):
             raise ValueError(_RECALL_GATE_ROUND2_ORDER_ERROR)
         return self
 
+    @field_validator(
+        "memory_source_count_threshold",
+        "topic_memory_source_count_threshold",
+        mode="before",
+    )
+    @classmethod
+    def reject_non_integer_count_threshold(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("Source count threshold must be a strict positive integer")  # noqa: TRY003, TRY004
+        return value
+
     schedule_seconds: float | None = Field(default=None, gt=0)
     memory_schedule_seconds: float | None = Field(default=None, gt=0)
+    # Startup threshold for automatic processing, counted in pending journal
+    # identities after each Family's last successful cursor. None keeps the
+    # existing time-only behavior.
+    memory_source_count_threshold: int | None = Field(default=None, ge=1)
     experience_schedule_seconds: float | None = Field(default=None, gt=0)
     dream_enabled: bool = True
     dream_max_pending_per_scope: int = Field(default=32, ge=1, le=1000)
     generation_concurrency: int = Field(default=4, ge=1, le=64)
     dream_budget: DreamBudget = Field(default_factory=DreamBudget)
     topic_memory_schedule_seconds: float | None = Field(default=None, gt=0)
+    topic_memory_source_count_threshold: int | None = Field(default=None, ge=1)
     topic_memory_source_window_limit: int = Field(default=10, ge=1)
     topic_memory_history_max_candidates: int = Field(default=20, ge=1, le=MAX_TOPIC_MEMORY_SEARCH_LIMIT)
     topic_memory_history_rrf_threshold: int = Field(default=70, ge=0, le=100)

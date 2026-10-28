@@ -488,6 +488,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            self._runtime._wake_count_triggered()
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -504,6 +505,7 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            self._runtime._wake_count_triggered()
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
 
 
@@ -531,11 +533,13 @@ class ScopedRecordApplication:
         /,
     ) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_source(
+            record = await self._runtime._records().create_source(
                 self.scope_id,
                 source_type,
                 content,
             )
+        self._runtime._wake_count_triggered()
+        return record
 
     async def get_source(self, source_type: str, source_id: str, /) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -563,7 +567,9 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        self._runtime._wake_count_triggered()
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -3014,6 +3020,7 @@ class BuiltinRuntime:
         statistics_service: StatisticsServiceFactory | None = None,
         record_service: RecordService | None = None,
         prompt_service: PromptService | None = None,
+        count_triggered_bindings: tuple[str, ...] = (),
         recall_token_estimator: RecallTokenEstimator | None = None,
         recall_effort_sink: RecallEffortSink | None = None,
         decision_model: DecisionModel | None = None,
@@ -3070,6 +3077,10 @@ class BuiltinRuntime:
         self._statistics_service = statistics_service
         self._record_service = record_service
         self._prompt_service = prompt_service
+        # Bindings whose processing starts on a pending-identity count. Capture
+        # notifies them after commit so an accepted invocation is dispatched
+        # immediately instead of waiting for the next time condition.
+        self._count_triggered_bindings = tuple(count_triggered_bindings)
         self._recall_token_estimator = recall_token_estimator
         self._recall_effort_sink = recall_effort_sink
         # Public read-only seam for the cross-family decision role; deterministic Runtime callers
@@ -3432,6 +3443,32 @@ class BuiltinRuntime:
         if self._record_service is None:
             raise _RuntimeStateError("records")
         return self._record_service
+
+    def _wake_count_triggered(self) -> None:
+        """Dispatch invocations accepted by a capture or Artifact write.
+
+        Called only after the accepting transaction commits, so a Supervisor
+        discovery pass observes the new request.
+        """
+
+        supervisor = self.artifact_processing_supervisor
+        if supervisor is None:
+            return
+        for binding_name in self._count_triggered_bindings:
+            try:
+                supervisor.wake(binding_name)
+            except Exception as error:
+                log_safely(
+                    logger,
+                    logging.WARNING,
+                    "Count-triggered processing wake failed after acceptance",
+                    exc_info=error,
+                    extra={
+                        "event": "artifact_processing.count_trigger.wake_failed",
+                        "outcome": "accepted",
+                        "binding": binding_name,
+                    },
+                )
 
     def _generation(self, scope_id: str) -> ReviewedGenerationService:
         if self._generation_service is None:

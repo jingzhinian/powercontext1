@@ -537,6 +537,7 @@ class RelationalContexts:
         handoff_artifact_id: str = "handoff",
         memory_artifact_id: str = "memory",
         source_registry: SourceDefinitionRegistry | None = None,
+        source_count_thresholds: Mapping[str, int] | None = None,
         cursor_secret: bytes | None = None,
         tracing: RuntimeTracing | None = None,
         prompt_registry: PromptRegistry | None = None,
@@ -554,7 +555,7 @@ class RelationalContexts:
         self.index = NoMemoryIndex() if index is None else index
         self.topic_memory_index = NoTopicMemoryIndex() if topic_memory_index is None else topic_memory_index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
-        source_repository = SourceRepository(self.source_registry)
+        source_repository = SourceRepository(self.source_registry, count_thresholds=source_count_thresholds)
         artifact_repository = ArtifactRepository(
             (Handoff, Memory, Experience, Skill, Profile, Prompt, TopicMemory),
             sources=source_repository,

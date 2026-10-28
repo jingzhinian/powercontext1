@@ -640,6 +640,7 @@ async def open_builtin_runtime(
                 remote_skill_distribution=contexts.remote_skill_distribution(),
                 statistics_service=contexts.statistics,
                 record_service=contexts.records,
+                count_triggered_bindings=tuple(_source_count_thresholds(config)),
                 prompt_service=contexts.prompts,
                 recall_token_estimator=contexts.estimate_recall_tokens,
                 recall_effort_sink=recall_effort_sink,
@@ -737,6 +738,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
     if config.runtime.artifact_processing_role == "api":
         return tuple(configured)
     _validate_processing_source_registry(config, configured, source_registry)
+    count_thresholds = _source_count_thresholds(config)
     injected_pipelines = injected_pipelines or {}
     for family in capabilities:
         if family in registered:
@@ -783,6 +785,7 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 if family == "profile" and config.runtime.profile_schedule_enabled
                 else None,
                 timezone=config.runtime.profile_timezone if family == "profile" else "Asia/Shanghai",
+                automatic_source_count_threshold=count_thresholds.get(binding),
                 pending_provider=None
                 if family == "skill"
                 else SourceProcessingPendingProvider(contexts.database, binding, family),
@@ -809,6 +812,19 @@ def _topic_memory_processing_available(
     return any(binding.binding_name == TOPIC_MEMORY_SOURCE_WINDOW_BINDING for binding in bindings) or (
         config.runtime.artifact_processing_role == "api" and "topic-memory" in processing_capabilities(config)
     )
+
+
+def _source_count_thresholds(config: BuiltinConfig) -> dict[str, int]:
+    """Map configured startup thresholds onto their canonical processing bindings."""
+
+    thresholds: dict[str, int] = {}
+    for binding, threshold in (
+        (FAMILY_BINDINGS["memory"], config.runtime.memory_source_count_threshold),
+        (TOPIC_MEMORY_SOURCE_WINDOW_BINDING, config.runtime.topic_memory_source_count_threshold),
+    ):
+        if threshold is not None:
+            thresholds[binding] = threshold
+    return thresholds
 
 
 def _topic_memory_provider_available(config: BuiltinConfig) -> bool:
@@ -948,6 +964,7 @@ async def open_builtin_contexts(
                 model_usage_write_timeout_seconds=config.runtime.model_usage_write_timeout_seconds,
                 model_usage_flush_timeout_seconds=config.runtime.model_usage_flush_timeout_seconds,
                 source_registry=source_registry,
+                source_count_thresholds=_source_count_thresholds(config),
                 cursor_secret=cursor_secret,
                 tracing=tracing,
             )
@@ -1025,6 +1042,7 @@ async def open_builtin_contexts(
             model_usage_write_timeout_seconds=config.runtime.model_usage_write_timeout_seconds,
             model_usage_flush_timeout_seconds=config.runtime.model_usage_flush_timeout_seconds,
             source_registry=source_registry,
+            source_count_thresholds=_source_count_thresholds(config),
             cursor_secret=cursor_secret,
             tracing=tracing,
         )

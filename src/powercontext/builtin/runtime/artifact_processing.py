@@ -79,6 +79,7 @@ _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
+_COUNT_RECHECK_SECONDS = 1.0
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -112,6 +113,10 @@ class ArtifactProcessingBinding:
     automatic_processing_interval: timedelta | None = None
     cron: str | None = None
     timezone: str = "Asia/Shanghai"
+    # Pending journal identities that accept one automatic invocation. The
+    # accepting writer publishes the request; this value only bounds how long a
+    # Supervisor waits before rechecking accepted requests it was not told about.
+    automatic_source_count_threshold: int | None = None
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
     # Only automatic admission is filtered; already accepted requests retain
@@ -138,6 +143,15 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        _require_count_threshold(self.automatic_source_count_threshold)
+
+
+def _require_count_threshold(value: int | None) -> None:
+    """Reject anything but an absent or strictly positive count threshold."""
+
+    if value is None or (type(value) is int and value > 0):
+        return
+    raise ValueError("automatic source count threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -401,6 +415,7 @@ class _FamilyState:
     discovery_pending: bool = True
     next_schedule_at: float | None = None
     next_discovery_at: float = 0.0
+    count_recheck_at: float = 0.0
     automatic_next: bool = False
     overflow_not_before: float = 0.0
     degraded: bool = False
@@ -613,6 +628,11 @@ class ArtifactProcessingSupervisor:
             if self._fence is None or self._lease_lost:
                 raise ArtifactProcessingLeadershipLostError(self._supervisor_group, self.holder_id, 0)
             now = asyncio.get_running_loop().time()
+            if state.binding.automatic_source_count_threshold is not None and now >= state.count_recheck_at:
+                # A writer outside this Supervisor's process cannot notify it.
+                # Bound how long an accepted count-triggered request waits.
+                state.count_recheck_at = now + _COUNT_RECHECK_SECONDS
+                state.discovery_pending = True
             # Reserve fresh admission before retries can occupy a newly freed
             # Worker. FIFO ready order then shares execution between channels.
             discoverable = (
@@ -1093,6 +1113,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.automatic_source_count_threshold is not None:
+                deadlines.append(state.count_recheck_at)
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
