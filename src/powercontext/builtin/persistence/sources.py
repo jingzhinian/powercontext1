@@ -30,6 +30,7 @@ from powercontext.builtin.artifacts.experience import EXPERIENCE_INCUBATION_CURS
 from powercontext.builtin.artifacts.profile.models import PROFILE_SOURCE_WINDOW_BINDING
 from powercontext.builtin.artifacts.topic_memory import TOPIC_MEMORY_SOURCE_WINDOW_BINDING
 from powercontext.builtin.persistence.codec import load_model, stored_bytes
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.errors import (
     IdentityMismatchError,
     InvalidRepositoryArgumentError,
@@ -79,12 +80,22 @@ class SourceRepository:
         self,
         definitions: SourceDefinitionRegistry | Iterable[_AnySourceAdapter],
         /,
+        *,
+        count_thresholds: Mapping[str, int] | None = None,
     ) -> None:
         self._registry = (
             definitions
             if isinstance(definitions, SourceDefinitionRegistry)
             else SourceDefinitionRegistry.from_adapters(definitions)
         )
+        # Families that start processing once enough pending journal identities
+        # accumulate. Absent entries keep the existing time-only behavior.
+        self._count_thresholds = dict(count_thresholds or {})
+        for binding_name, threshold in self._count_thresholds.items():
+            if not isinstance(binding_name, str) or not binding_name.strip():
+                raise InvalidRepositoryArgumentError("binding_name", "must be a non-empty trimmed identifier")
+            if type(threshold) is not int or threshold < 1:
+                raise InvalidRepositoryArgumentError("count threshold", "must be positive")  # noqa: TRY003
 
     async def add(
         self,
@@ -168,10 +179,35 @@ class SourceRepository:
         # Centralized here so capture, record projection and import all publish
         # discoverable input atomically. Replayed Source identities do not dirty
         # a binding again. Disabled processors simply retain ordinary dirty.
+        await self._publish_journal_identity(connection, scope_id, position)
+        return StoredSource(ref=ref, value=source, journal_position=position), True
+
+    async def _publish_journal_identity(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        position: int,
+        /,
+    ) -> None:
+        """Publish one new journal identity to every Source-driven processor.
+
+        A count-triggered Family additionally accepts one invocation in this same
+        transaction once the identities after its last successful cursor reach
+        the configured threshold. Duplicate captures and receipt trust upgrades
+        return before the journal insert, so they never accept work here.
+        """
+
         intents = ArtifactProcessingIntentRepository()
+        cursors = SourceCursorRepository()
         for binding_name in SOURCE_PROCESSING_BINDINGS:
             await intents.mark_dirty(connection, scope_id, binding_name)
-        return StoredSource(ref=ref, value=source, journal_position=position), True
+            threshold = self._count_thresholds.get(binding_name)
+            if threshold is None:
+                continue
+            cursor = await cursors.load(connection, scope_id, binding_name)
+            if position - (0 if cursor is None else cursor.cursor.sequence) < threshold:
+                continue
+            await intents.request(connection, scope_id, binding_name)
 
     async def get(
         self,
